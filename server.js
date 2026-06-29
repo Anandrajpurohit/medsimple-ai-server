@@ -1,5 +1,6 @@
 // ============================================================
-// MEDSIMPLE AI - WhatsApp Automation Server (Meta Cloud API)
+// MEDSIMPLE AI - WhatsApp Automation Server
+// Meta Cloud API + Airtable subscriber management
 // ============================================================
 
 const express = require('express');
@@ -9,360 +10,177 @@ const Anthropic = require('@anthropic-ai/sdk');
 const app = express();
 app.use(express.json());
 
-const CLAUDE_API_KEY  = process.env.CLAUDE_API_KEY;
-const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
+const CLAUDE_API_KEY   = process.env.CLAUDE_API_KEY;
+const WHATSAPP_TOKEN   = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID;
+const VERIFY_TOKEN     = process.env.VERIFY_TOKEN;
+const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
+const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
 
 const claude = new Anthropic({ apiKey: CLAUDE_API_KEY });
 
-const SYSTEM_PROMPT = `You are MedSimple AI - a friendly medical report explainer.
-NEVER diagnose. NEVER prescribe. Add: "Educational only. Consult your doctor."
-Explain each test value simply with emojis. Use user's chosen language.`;
+const PAYMENT_MSG = `Choose your MedSimple AI plan:
 
-const userPreferences = {};
+India (UPI): Reply "pay india" for UPI link
+International (PayPal): Reply "pay intl" for PayPal link
+
+Plans: 1 report / 3 reports / Unlimited monthly
+
+After payment, send your transaction ID here to activate!`;
+
+const SYSTEM_PROMPT = `You are MedSimple AI - a friendly medical report explainer.
+RULES: Never diagnose. Never prescribe. Always say "Educational only. Consult your doctor."
+Format: Use emojis. Explain each test simply. Give 3 doctor questions. Give next steps.
+Languages: 2=Hindi, 3=Arabic, 4=Spanish, 5=French, 6=German, 7=Russian, 8=Italian`;
+
+const userPrefs = {};
+const subCache = {};
+const CACHE_TTL = 5 * 60 * 1000;
+
+async function isSubscriber(phone) {
+  const c = subCache[phone];
+  if (c && Date.now() - c.t < CACHE_TTL) return c.active;
+  if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) return true;
+  try {
+    const r = await axios.get(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/Subscribers`,
+      { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+        params: { filterByFormula: `AND({Phone}='${phone}',{Status}='Active')`, maxRecords: 1 } }
+    );
+    const active = r.data.records.length > 0;
+    subCache[phone] = { active, t: Date.now() };
+    return active;
+  } catch (e) { return false; }
+}
+
+async function activateSubscriber(phone, plan, txnId) {
+  if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) return;
+  try {
+    const ex = await axios.get(
+      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/Subscribers`,
+      { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+        params: { filterByFormula: `{Phone}='${phone}'`, maxRecords: 1 } }
+    );
+    const fields = { Status: 'Active', Plan: plan, TxnId: txnId, ActivatedAt: new Date().toISOString() };
+    if (plan === 'unlimited') fields.ExpiresAt = new Date(Date.now()+30*24*60*60*1000).toISOString();
+    if (ex.data.records.length > 0) {
+      await axios.patch(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/Subscribers/${ex.data.records[0].id}`,
+        { fields }, { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } });
+    } else {
+      await axios.post(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/Subscribers`,
+        { fields: { Phone: phone, ...fields } },
+        { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' } });
+    }
+    subCache[phone] = { active: true, t: Date.now() };
+  } catch (e) { console.error('Airtable error:', e.message); }
+}
 
 async function sendMsg(to, text) {
   const MAX = 1500;
-  const parts = text.length <= MAX ? [text] : text.match(new RegExp('[\\s\\S]{1,' + MAX + '}', 'g'));
-  for (const part of parts) {
+  const parts = text.length <= MAX ? [text] : (() => {
+    const out = []; let cur = '';
+    for (const p of text.split('\n\n')) {
+      if ((cur+p).length > MAX) { if(cur) out.push(cur.trim()); cur=p+'\n\n'; } else cur+=p+'\n\n';
+    }
+    if (cur.trim()) out.push(cur.trim()); return out;
+  })();
+  for (const part of parts)
     await axios.post(`https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`,
-      { messaging_product: 'whatsapp', to, type: 'text', text: { body: part } },
-      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
-    );
-  }
+      { messaging_product:'whatsapp', to, type:'text', text:{body:part} },
+      { headers:{ Authorization:`Bearer ${WHATSAPP_TOKEN}`, 'Content-Type':'application/json' } });
 }
 
 async function downloadMedia(mediaId) {
-  const r = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
-  const file = await axios.get(r.data.url, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
-  return { base64: Buffer.from(file.data).toString('base64'), mimeType: r.data.mime_type };
+  const r = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`,{headers:{Authorization:`Bearer ${WHATSAPP_TOKEN}`}});
+  const f = await axios.get(r.data.url,{responseType:'arraybuffer',headers:{Authorization:`Bearer ${WHATSAPP_TOKEN}`}});
+  return { base64: Buffer.from(f.data).toString('base64'), mimeType: r.data.mime_type };
 }
 
-app.get('/', (req, res) => res.send('MedSimple AI running!'));
+app.get('/', (_,res) => res.send('MedSimple AI Running! 🏥'));
 
-app.get('/webhook', (req, res) => {
-  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN)
-    res.send(req.query['hub.challenge']);
+app.get('/webhook', (req,res) => {
+  if (req.query['hub.mode']==='subscribe' && req.query['hub.verify_token']===VERIFY_TOKEN)
+    res.status(200).send(req.query['hub.challenge']);
   else res.sendStatus(403);
 });
 
-app.post('/webhook', async (req, res) => {
+app.post('/activate', async (req,res) => {
+  const {phone,plan,txnId,secret} = req.body;
+  if (secret!==VERIFY_TOKEN) return res.sendStatus(403);
+  await activateSubscriber(phone, plan||'manual', txnId||'admin');
+  await sendMsg(phone, 'Your MedSimple AI account is now ACTIVE! Send "Hi" to start.');
+  res.json({success:true});
+});
+
+app.post('/webhook', async (req,res) => {
   res.sendStatus(200);
   try {
     const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!msg) return;
-    const from = msg.from, type = msg.type, text = msg.text?.body || '';
-    let reply = '';
-    if (type === 'image') {
-      const { base64, mimeType } = await downloadMedia(msg.image.id);
-      const lang = userPreferences[from] || 'English';
-      const r = await claude.messages.create({
-        model: 'claude-opus-4-5', max_tokens: 2000,
-        system: SYSTEM_PROMPT + '\nLanguage: ' + lang,
-        messages: [{ role: 'user', content: [
-          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
-          { type: 'text', text: 'Explain this medical report in ' + lang }
+    const from = msg.from;
+    const type = msg.type;
+    const text = (msg.text?.body||'').trim();
+    const low = text.toLowerCase();
+
+    if (type==='text' && (low==='hi'||low==='hello'||low==='start')) {
+      await sendMsg(from, 'Welcome to MedSimple AI! I explain medical reports in simple language.\n\n'+PAYMENT_MSG);
+      return;
+    }
+
+    if (type==='text' && (low.includes('paid')||low.includes('txn')||low.includes('upi')||/^[a-z0-9]{8,}$/i.test(text))) {
+      await activateSubscriber(from, 'pending', text);
+      await sendMsg(from, 'Payment noted! Your account will be activated within a few minutes.');
+      return;
+    }
+
+    if (!await isSubscriber(from)) {
+      await sendMsg(from, 'Subscribe to use MedSimple AI!\n\n'+PAYMENT_MSG);
+      return;
+    }
+
+    if (type==='text' && ['1','2','3','4','5','6','7','8'].includes(text)) {
+      const langs={'1':'English','2':'Hindi','3':'Arabic','4':'Spanish','5':'French','6':'German','7':'Russian','8':'Italian'};
+      userPrefs[from]=langs[text];
+      await sendMsg(from, langs[text]+' selected! Now send your medical report photo.');
+      return;
+    }
+
+    if (type==='image') {
+      const lang = userPrefs[from]||'English';
+      await sendMsg(from,'Analysing your report... 15-20 seconds please...');
+      const {base64,mimeType} = await downloadMedia(msg.image.id);
+      const ai = await claude.messages.create({
+        model:'claude-opus-4-5', max_tokens:2000,
+        system:SYSTEM_PROMPT+`\nLanguage: ${lang}`,
+        messages:[{role:'user',content:[
+          {type:'image',source:{type:'base64',media_type:mimeType||'image/jpeg',data:base64}},
+          {type:'text',text:`Explain this medical report in ${lang}.`}
         ]}]
       });
-      reply = r.content[0].text;
-    } else if (type === 'document') {
-      reply = '📄 Please send a screenshot of the PDF instead for best results!';
-    } else if (['1','2','3','4','5','6','7','8'].includes(text.trim())) {
-      const langs = {'1':'English','2':'Hindi','3':'Arabic','4':'Spanish','5':'French','6':'German','7':'Russian','8':'Italian'};
-      userPreferences[from] = langs[text.trim()];
-      reply = '✅ ' + langs[text.trim()] + ' selected! Now send your medical report photo 🔬';
-    } else if (['hi','hello','paid','activate','activated'].includes(text.toLowerCase()) || !text) {
-      reply = '👋 *Welcome to MedSimple AI!*\n\nChoose language:\n1️⃣ English\n2️⃣ हिंदी\n3️⃣ العربية\n4️⃣ Español\n5️⃣ Français\n6️⃣ Deutsch\n7️⃣ Русский\n8️⃣ Italiano';
-    } else {
-      const lang = userPreferences[from] || 'English';
-      const r = await claude.messages.create({
-        model: 'claude-opus-4-5', max_tokens: 1000,
-        system: SYSTEM_PROMPT + '\nLanguage: ' + lang,
-        messages: [{ role: 'user', content: text }]
-      });
-      reply = r.content[0].text;
+      await sendMsg(from, ai.content[0].text);
+      return;
     }
-    if (reply) await sendMsg(from, reply);
-  } catch(e) { console.error(e.response?.data || e.message); }
-});
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('MedSimple AI server on port ' + PORT));// ============================================================
-// MEDSIMPLE AI - WhatsApp Automation Server
-// Receives WhatsApp messages via Twilio → Calls Claude AI → Replies
-// Deploy free on Render.com
-// ============================================================
+    if (type==='document') {
+      await sendMsg(from,'For PDFs: screenshot each page and send as image. I will explain every value!');
+      return;
+    }
 
-const express = require('express');
-const axios = require('axios');
-const Anthropic = require('@anthropic-ai/sdk');
-const twilio = require('twilio');
-
-const app = express();
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
-
-// ── CONFIG (set these as Environment Variables on Render) ──
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER; // e.g. whatsapp:+14155238886
-
-const claude = new Anthropic({ apiKey: CLAUDE_API_KEY });
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
-// ── THE MEDICAL REPORT EXPLAINER PROMPT ──
-const SYSTEM_PROMPT = `You are MedSimple AI — a friendly, expert medical report explainer.
-
-Your job is to explain medical reports in simple, clear language that anyone can understand.
-
-STRICT RULES:
-1. NEVER diagnose. NEVER prescribe. NEVER replace a doctor.
-2. Always add: "⚠️ This is educational only. Please consult your doctor."
-3. Be warm, caring, and reassuring — patients are often scared.
-4. Use emojis to make it friendly: ✅ for normal, ⚠️ for borderline, 🔴 for concerning.
-
-REPORT EXPLANATION FORMAT:
-━━━━━━━━━━━━━━━━━━━
-🔬 *MEDSIMPLE AI REPORT ANALYSIS*
-━━━━━━━━━━━━━━━━━━━
-
-*📊 YOUR RESULTS — VALUE BY VALUE:*
-
-For each test value:
-• *[Test Name]: [Value]* — Normal range: [range]
-  → [Simple 1-2 line explanation]
-  → Status: ✅ Normal / ⚠️ Borderline / 🔴 Needs attention
-
-*⚠️ KEY THINGS TO WATCH:*
-[Summarize the important findings in 2-3 sentences]
-
-*❓ ASK YOUR DOCTOR THESE 3 QUESTIONS:*
-1. [Specific question based on the report]
-2. [Specific question based on the report]
-3. [Specific question based on the report]
-
-*📋 NEXT STEPS:*
-[Simple, actionable advice — diet, lifestyle, follow-up timing]
-
-━━━━━━━━━━━━━━━━━━━
-⚠️ Educational only. Not medical advice. Always consult your doctor.
-━━━━━━━━━━━━━━━━━━━
-
-LANGUAGE SELECTION:
-If user says "Hindi" or "2" → respond in Hindi (Devanagari script)
-If user says "Arabic" or "3" → respond in Arabic
-If user says "Spanish" or "4" → respond in Spanish
-If user says "French" or "5" → respond in French
-If user says "German" or "6" → respond in German
-If user says "Russian" or "7" → respond in Russian
-If user says "Italian" or "8" → respond in Italian
-Default → English
-
-ACTIVATION FLOW:
-When user first messages (activation/payment screenshot):
-→ Reply with language selection menu:
-
-👋 *Welcome to MedSimple AI!*
-
-Your account is now *ACTIVE* ✅
-
-Please choose your language:
-1️⃣ English
-2️⃣ हिंदी (Hindi)
-3️⃣ العربية (Arabic)
-4️⃣ Español (Spanish)
-5️⃣ Français (French)
-6️⃣ Deutsch (German)
-7️⃣ Русский (Russian)
-8️⃣ Italiano (Italian)
-
-Reply with the number of your choice, then send your medical report photo or PDF! 📋`;
-
-// Simple in-memory store for user language preferences
-const userPreferences = {};
-
-// ── HEALTH CHECK ──
-app.get('/', (req, res) => {
-  res.send('MedSimple AI Server is running! 🏥');
-});
-
-// ── MAIN WEBHOOK — receives WhatsApp messages from Twilio ──
-app.post('/webhook', async (req, res) => {
-  try {
-    const from = req.body.From; // e.g. "whatsapp:+919876543210"
-    const body = req.body.Body || '';
-    const mediaUrl = req.body.MediaUrl0; // image/PDF if sent
-    const mediaType = req.body.MediaContentType0;
-    const numMedia = parseInt(req.body.NumMedia || '0');
-
-    console.log(`Message from ${from}: "${body}" | Media: ${numMedia} file(s)`);
-
-    let responseText = '';
-
-    // ── CASE 1: User sent an image or PDF (medical report) ──
-    if (numMedia > 0 && mediaUrl) {
-      console.log(`Processing media: ${mediaType} from ${mediaUrl}`);
-
-      const userLang = userPreferences[from] || 'English';
-
-      // Download the image from Twilio (needs auth)
-      const imageResponse = await axios.get(mediaUrl, {
-        responseType: 'arraybuffer',
-        auth: {
-          username: process.env.TWILIO_ACCOUNT_SID,
-          password: process.env.TWILIO_AUTH_TOKEN
-        }
-      });
-
-      const imageBase64 = Buffer.from(imageResponse.data).toString('base64');
-      const imageMimeType = mediaType || 'image/jpeg';
-
-      // Determine if it's an image we can send to Claude
-      const isImage = imageMimeType.startsWith('image/');
-
-      if (isImage) {
-        // Call Claude with the image
-        const message = await claude.messages.create({
-          model: 'claude-opus-4-5',
-          max_tokens: 2000,
-          system: SYSTEM_PROMPT + `\n\nUser's preferred language: ${userLang}`,
-          messages: [{
-            role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: imageMimeType,
-                  data: imageBase64
-                }
-              },
-              {
-                type: 'text',
-                text: `Please explain this medical report in ${userLang}. Follow the exact format in your instructions.`
-              }
-            ]
-          }]
-        });
-
-        responseText = message.content[0].text;
-      } else {
-        // PDF — can't process image, ask for photo
-        responseText = `📄 I received your PDF!
-
-For best results, please:
-1. Open the PDF on your phone
-2. Take a clear screenshot of each page
-3. Send the screenshot(s) to me
-
-I'll explain it right away! 🔬`;
+    if (type==='text') {
+      if (low==='language'||low==='change language') {
+        await sendMsg(from,'Choose:\n1 English\n2 Hindi\n3 Arabic\n4 Spanish\n5 French\n6 German\n7 Russian\n8 Italian');
+        return;
       }
-    }
-
-    // ── CASE 2: Language selection (1-8) ──
-    else if (['1','2','3','4','5','6','7','8'].includes(body.trim())) {
-      const langs = {
-        '1': 'English', '2': 'Hindi', '3': 'Arabic', '4': 'Spanish',
-        '5': 'French', '6': 'German', '7': 'Russian', '8': 'Italian'
-      };
-      const selectedLang = langs[body.trim()];
-      userPreferences[from] = selectedLang;
-
-      responseText = `✅ *${selectedLang} selected!*
-
-Now please:
-
-📋 *Quick profile for accurate results:*
-1. What is your age?
-2. Male or Female?
-3. Any known conditions? (diabetes, BP, thyroid, none?)
-
-Then send your *medical report photo* and I'll explain every value! 🔬`;
-    }
-
-    // ── CASE 3: Activation / Hi / payment confirmation ──
-    else if (body.toLowerCase().includes('paid') ||
-             body.toLowerCase().includes('activated') ||
-             body.toLowerCase().includes('activate') ||
-             body.toLowerCase() === 'hi' ||
-             body.toLowerCase() === 'hello' ||
-             body.trim() === '') {
-      responseText = `👋 *Welcome to MedSimple AI!*
-
-Your account is now *ACTIVE* ✅
-
-Please choose your language:
-1️⃣ English
-2️⃣ हिंदी (Hindi)
-3️⃣ العربية (Arabic)
-4️⃣ Español (Spanish)
-5️⃣ Français (French)
-6️⃣ Deutsch (German)
-7️⃣ Русский (Russian)
-8️⃣ Italiano (Italian)
-
-Reply with the number of your choice, then send your medical report photo or PDF! 📋`;
-    }
-
-    // ── CASE 4: Text message — try to process as report or profile info ──
-    else {
-      const userLang = userPreferences[from] || 'English';
-
-      const message = await claude.messages.create({
-        model: 'claude-opus-4-5',
-        max_tokens: 1000,
-        system: SYSTEM_PROMPT + `\n\nUser's preferred language: ${userLang}`,
-        messages: [{
-          role: 'user',
-          content: body
-        }]
+      const lang = userPrefs[from]||'English';
+      const ai = await claude.messages.create({
+        model:'claude-opus-4-5', max_tokens:1000,
+        system:SYSTEM_PROMPT+`\nLanguage: ${lang}`,
+        messages:[{role:'user',content:text}]
       });
-
-      responseText = message.content[0].text;
+      await sendMsg(from, ai.content[0].text);
     }
-
-    // ── SEND REPLY VIA TWILIO ──
-    // WhatsApp has 1600 char limit per message — split if needed
-    const MAX_LENGTH = 1500;
-    const messages = [];
-
-    if (responseText.length <= MAX_LENGTH) {
-      messages.push(responseText);
-    } else {
-      // Split at paragraph breaks
-      const paragraphs = responseText.split('\n\n');
-      let current = '';
-      for (const para of paragraphs) {
-        if ((current + para).length > MAX_LENGTH) {
-          if (current) messages.push(current.trim());
-          current = para + '\n\n';
-        } else {
-          current += para + '\n\n';
-        }
-      }
-      if (current.trim()) messages.push(current.trim());
-    }
-
-    // Send each part
-    for (const msgText of messages) {
-      await twilioClient.messages.create({
-        from: TWILIO_WHATSAPP_NUMBER,
-        to: from,
-        body: msgText
-      });
-    }
-
-    console.log(`Replied to ${from} with ${messages.length} message(s)`);
-    res.status(200).send('OK');
-
-  } catch (error) {
-    console.error('Webhook error:', error.message);
-    res.status(500).send('Error');
-  }
+  } catch(e){ console.error('Error:',e.response?.data||e.message); }
 });
 
-// ── START SERVER ──
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`MedSimple AI server running on port ${PORT}`);
-});
+const PORT = process.env.PORT||3000;
+app.listen(PORT,()=>console.log(`MedSimple AI on port ${PORT}`));
