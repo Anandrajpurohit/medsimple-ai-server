@@ -1,4 +1,94 @@
 // ============================================================
+// MEDSIMPLE AI - WhatsApp Automation Server (Meta Cloud API)
+// ============================================================
+
+const express = require('express');
+const axios = require('axios');
+const Anthropic = require('@anthropic-ai/sdk');
+
+const app = express();
+app.use(express.json());
+
+const CLAUDE_API_KEY  = process.env.CLAUDE_API_KEY;
+const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
+
+const claude = new Anthropic({ apiKey: CLAUDE_API_KEY });
+
+const SYSTEM_PROMPT = `You are MedSimple AI - a friendly medical report explainer.
+NEVER diagnose. NEVER prescribe. Add: "Educational only. Consult your doctor."
+Explain each test value simply with emojis. Use user's chosen language.`;
+
+const userPreferences = {};
+
+async function sendMsg(to, text) {
+  const MAX = 1500;
+  const parts = text.length <= MAX ? [text] : text.match(new RegExp('[\\s\\S]{1,' + MAX + '}', 'g'));
+  for (const part of parts) {
+    await axios.post(`https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`,
+      { messaging_product: 'whatsapp', to, type: 'text', text: { body: part } },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  }
+}
+
+async function downloadMedia(mediaId) {
+  const r = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
+  const file = await axios.get(r.data.url, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
+  return { base64: Buffer.from(file.data).toString('base64'), mimeType: r.data.mime_type };
+}
+
+app.get('/', (req, res) => res.send('MedSimple AI running!'));
+
+app.get('/webhook', (req, res) => {
+  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN)
+    res.send(req.query['hub.challenge']);
+  else res.sendStatus(403);
+});
+
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!msg) return;
+    const from = msg.from, type = msg.type, text = msg.text?.body || '';
+    let reply = '';
+    if (type === 'image') {
+      const { base64, mimeType } = await downloadMedia(msg.image.id);
+      const lang = userPreferences[from] || 'English';
+      const r = await claude.messages.create({
+        model: 'claude-opus-4-5', max_tokens: 2000,
+        system: SYSTEM_PROMPT + '\nLanguage: ' + lang,
+        messages: [{ role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } },
+          { type: 'text', text: 'Explain this medical report in ' + lang }
+        ]}]
+      });
+      reply = r.content[0].text;
+    } else if (type === 'document') {
+      reply = '📄 Please send a screenshot of the PDF instead for best results!';
+    } else if (['1','2','3','4','5','6','7','8'].includes(text.trim())) {
+      const langs = {'1':'English','2':'Hindi','3':'Arabic','4':'Spanish','5':'French','6':'German','7':'Russian','8':'Italian'};
+      userPreferences[from] = langs[text.trim()];
+      reply = '✅ ' + langs[text.trim()] + ' selected! Now send your medical report photo 🔬';
+    } else if (['hi','hello','paid','activate','activated'].includes(text.toLowerCase()) || !text) {
+      reply = '👋 *Welcome to MedSimple AI!*\n\nChoose language:\n1️⃣ English\n2️⃣ हिंदी\n3️⃣ العربية\n4️⃣ Español\n5️⃣ Français\n6️⃣ Deutsch\n7️⃣ Русский\n8️⃣ Italiano';
+    } else {
+      const lang = userPreferences[from] || 'English';
+      const r = await claude.messages.create({
+        model: 'claude-opus-4-5', max_tokens: 1000,
+        system: SYSTEM_PROMPT + '\nLanguage: ' + lang,
+        messages: [{ role: 'user', content: text }]
+      });
+      reply = r.content[0].text;
+    }
+    if (reply) await sendMsg(from, reply);
+  } catch(e) { console.error(e.response?.data || e.message); }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('MedSimple AI server on port ' + PORT));// ============================================================
 // MEDSIMPLE AI - WhatsApp Automation Server
 // Receives WhatsApp messages via Twilio → Calls Claude AI → Replies
 // Deploy free on Render.com
